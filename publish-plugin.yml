@@ -1,0 +1,42 @@
+name: Publish Windy plugin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Publish to Windy
+        env:
+          WINDY_API_KEY: ${{ secrets.WINDY_API_KEY }}
+        run: |
+          set -e
+          cd dist
+          printf '{"repositoryName":"https://github.com/%s","commitSha":"%s","repositoryOwner":"%s"}\n' "$GITHUB_REPOSITORY" "${GITHUB_SHA::7}" "$GITHUB_REPOSITORY_OWNER" > plugin-info.json
+          jq -s '.[0] * .[1]' plugin.json plugin-info.json > plugin2.json
+          mv plugin2.json plugin.json
+          tar cf plugin.tar --exclude='./plugin.tar' .
+          echo "Windy response:"
+          curl -sS --fail-with-body \
+            -X POST 'https://node.windy.com/plugins/v1.0/upload' \
+            -H "x-windy-api-key: ${WINDY_API_KEY}" \
+            -F 'plugin_archive=@./plugin.tar'
+          echo
