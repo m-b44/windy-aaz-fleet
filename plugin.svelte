@@ -80,7 +80,7 @@
     {/each}
   </div>
 
-  <div class="footer-note">Auto refresh every 20 seconds · Trails show the current flight leg from adsb.lol when enabled.</div>
+  <div class="footer-note">Auto refresh every 20 seconds · Aircraft are queried one at a time · Trails show the current flight from takeoff.</div>
 </section>
 
 <script lang="ts">
@@ -151,9 +151,10 @@
   };
 
   const STORAGE_KEY = 'windy-aaz-fleet-registrations-v1';
-  const TRAIL_STORAGE_KEY = 'windy-aaz-fleet-trails-v3';
+  const TRAIL_STORAGE_KEY = 'windy-aaz-fleet-trails-v4';
   const TRAIL_PREFS_STORAGE_KEY = 'windy-aaz-fleet-trail-prefs-v1';
   const POLL_MS = 20_000;
+  const LIVE_REQUEST_GAP_MS = 2_500;
   const MAX_TRAIL_POINTS = 3000;
   const MAX_TRAIL_AGE_MS = 12 * 60 * 60 * 1000;
   const MAX_LEG_GAP_MS = 45 * 60 * 1000;
@@ -161,7 +162,6 @@
   let registrations: string[] = [];
   let aircraftByReg: Record<string, AircraftState> = {};
   let markers = new Map<string, any>();
-  let markerAnimations = new Map<string, number>();
   let trailLines = new Map<string, any>();
   let trailCasings = new Map<string, any>();
   let refreshTimer: number | undefined;
@@ -170,6 +170,8 @@
   let selectedRegistration: string | null = null;
   let followSelected = false;
   let trailPreferences: Record<string, boolean> = {};
+  let relayCursor = 0;
+  let zoomFixTimer: number | undefined;
 
   $: hasPositions = Object.values(aircraftByReg).some(a => a.lat !== null && a.lon !== null);
 
@@ -352,30 +354,45 @@
     return [...next, [lat, lon, now] as TrailPoint].slice(-MAX_TRAIL_POINTS);
   };
 
-  async function fetchJsonViaRelay<T>(target: string, timeoutMs = 11_000): Promise<T> {
-    const relayUrls = [
-      `https://proxy.cors.dev/?url=${encodeURIComponent(target)}`,
-      `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`,
+  async function fetchJsonViaRelay<T>(target: string, timeoutMs = 8_000): Promise<T> {
+    // Windy plugins run in the browser and adsb.lol does not currently expose
+    // browser CORS headers. Rotate between public read-only relays and never
+    // issue more than one aircraft lookup at a time.
+    const relayBuilders = [
+      // cors.dev's documented anonymous format is a URL prefix, not ?url=.
+      // Its free public-GET tier has no monthly quota and easily covers this plugin's polling rate.
+      (url: string) => `https://proxy.cors.dev/${url}`,
+      (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
     ];
+
+    const startIndex = relayCursor % relayBuilders.length;
+    relayCursor = (relayCursor + 1) % relayBuilders.length;
     let lastError: Error | null = null;
 
-    // adsb.lol does not expose browser CORS headers. Use cors.dev first and
-    // automatically fall back to AllOrigins if the shared relay/upstream is rate-limited.
-    for (let index = 0; index < relayUrls.length; index += 1) {
+    for (let attempt = 0; attempt < relayBuilders.length; attempt += 1) {
+      const builder = relayBuilders[(startIndex + attempt) % relayBuilders.length];
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
 
       try {
-        const response = await fetch(relayUrls[index], {
+        const response = await fetch(builder(target), {
           credentials: 'omit',
           cache: 'no-store',
           signal: controller.signal,
+          headers: { Accept: 'application/json' },
         });
 
-        if (response.ok) return (await response.json()) as T;
-
-        const relayError = response.headers.get('X-Cors-Error');
-        lastError = new Error(relayError || `Request failed (${response.status}).`);
+        if (response.ok) {
+          const text = await response.text();
+          try {
+            return JSON.parse(text) as T;
+          } catch {
+            lastError = new Error('ADS-B service returned an invalid response.');
+          }
+        } else {
+          const relayError = response.headers.get('X-Cors-Error');
+          lastError = new Error(relayError || `Request failed (${response.status}).`);
+        }
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') {
           lastError = new Error('ADS-B lookup timed out.');
@@ -386,7 +403,7 @@
         window.clearTimeout(timeout);
       }
 
-      if (index < relayUrls.length - 1) await sleep(500);
+      if (attempt < relayBuilders.length - 1) await sleep(650);
     }
 
     throw lastError || new Error('Unable to load ADS-B data.');
@@ -466,6 +483,22 @@
     return currentFlightLeg(traceSamples(payload));
   };
 
+  const trailWithLivePoint = (trail: TrailPoint[], state: AircraftState): TrailPoint[] => {
+    if (state.lat === null || state.lon === null) return trail.slice(-MAX_TRAIL_POINTS);
+
+    const liveTimestamp = Date.now() - Math.max(0, Number(state.seenPositionSeconds || 0)) * 1000;
+    const next = [...trail];
+    const last = next[next.length - 1];
+
+    if (!last || Math.abs(last[0] - state.lat) > 0.00001 || Math.abs(last[1] - state.lon) > 0.00001) {
+      next.push([state.lat, state.lon, liveTimestamp]);
+    } else if (liveTimestamp > last[2]) {
+      next[next.length - 1] = [state.lat, state.lon, liveTimestamp];
+    }
+
+    return next.slice(-MAX_TRAIL_POINTS);
+  };
+
   const loadFlightTrail = async (registration: string): Promise<void> => {
     const state = aircraftByReg[registration];
     if (!state?.hex || state.trailHistoryLoading || state.trailHistoryLoaded) return;
@@ -479,7 +512,10 @@
       const historicalTrail = await fetchFlightTrail(state.hex);
       const latest = aircraftByReg[registration];
       if (!latest) return;
-      const merged = historicalTrail.length > 1 ? historicalTrail : latest.trail;
+      const baseTrail = historicalTrail.length > 1 ? historicalTrail : latest.trail;
+      // Always join the historical current-flight trace to the latest live ADS-B position.
+      // This prevents the visible gap that could appear between the trail and the aircraft.
+      const merged = trailWithLivePoint(baseTrail, latest);
       const updated = {
         ...latest,
         trail: merged.slice(-MAX_TRAIL_POINTS),
@@ -588,104 +624,17 @@
     }
   };
 
-  const stateFromAdsbItem = (registration: string, item: AdsbAircraft | undefined, checkedAt: number): AircraftState => {
-    const previous = aircraftByReg[registration] || emptyState(registration);
-
-    if (!item) {
-      const hasLastPosition = previous.lat !== null && previous.lon !== null;
-      return {
-        ...previous,
-        status: hasLastPosition ? 'stale' : 'missing',
-        error: hasLastPosition ? 'No new ADS-B position. Showing the last known position.' : 'No live ADS-B signal right now.',
-        lastCheckedAt: checkedAt,
-      };
-    }
-
-    const position = choosePosition(item);
-    const age = position.seen;
-    const status: AircraftState['status'] = age !== null && age <= 90 ? 'live' : 'stale';
-    const heading = item.track ?? item.true_heading ?? item.mag_heading ?? previous.track;
-
-    return {
-      registration,
-      hex: item.hex || previous.hex,
-      flight: item.flight?.trim() || null,
-      typeCode: item.t || null,
-      lat: position.lat,
-      lon: position.lon,
-      altitude: item.alt_baro ?? item.alt_geom ?? null,
-      groundSpeed: item.gs ?? null,
-      track: heading ?? null,
-      seenPositionSeconds: age,
-      status: position.lat === null ? 'missing' : status,
-      error: position.lat === null ? 'Aircraft found, but no position is available.' : null,
-      lastCheckedAt: checkedAt,
-      trail: updateTrail(previous.trail, item, position.lat, position.lon),
-      trailVisible: previous.trailVisible,
-      trailHistoryLoaded: previous.trailHistoryLoaded,
-      trailHistoryLoading: previous.trailHistoryLoading,
-    };
-  };
-
   const refreshFleet = async (): Promise<void> => {
     if (refreshing || registrations.length === 0) return;
     refreshing = true;
 
-    // One adsb.lol request can match multiple registrations. This avoids sending
-    // one relay/API request per aircraft, which was causing the second aircraft
-    // to time out or hit 429s.
-    const previousStates = Object.fromEntries(registrations.map(registration => [registration, aircraftByReg[registration] || emptyState(registration)]));
-    aircraftByReg = {
-      ...aircraftByReg,
-      ...Object.fromEntries(registrations.map(registration => [registration, { ...previousStates[registration], status: 'loading' as const, error: null }])),
-    };
-
     try {
-      const query = registrations.map(adsbRegistration).join(',');
-      const target = `https://api.adsb.lol/v2/reg/${encodeURIComponent(query)}`;
-      const payload = await fetchJsonViaRelay<AdsbResponse>(target);
-      const checkedAt = Date.now();
-      const byRegistration = new Map<string, AdsbAircraft>();
-
-      for (const item of payload.ac || []) {
-        const itemReg = normalizeRegistration(item.r || '');
-        if (itemReg) byRegistration.set(itemReg, item);
+      // Query one registration at a time. The bulk registration URL proved unreliable
+      // through browser CORS relays and could make every aircraft time out together.
+      for (let index = 0; index < registrations.length; index += 1) {
+        await refreshOne(registrations[index]);
+        if (index < registrations.length - 1) await sleep(LIVE_REQUEST_GAP_MS);
       }
-
-      const nextStates: Record<string, AircraftState> = {};
-      for (const registration of registrations) {
-        // In the unlikely case the source omitted the registration field, allow a
-        // single-aircraft response to fall back to its first returned item.
-        const item = byRegistration.get(registration) || (registrations.length === 1 ? payload.ac?.[0] : undefined);
-        nextStates[registration] = stateFromAdsbItem(registration, item, checkedAt);
-      }
-
-      aircraftByReg = { ...aircraftByReg, ...nextStates };
-      saveTrails();
-      Object.values(nextStates).forEach(state => {
-        renderAircraft(state);
-        if (state.trailVisible && state.hex && !state.trailHistoryLoaded && !state.trailHistoryLoading) {
-          void loadFlightTrail(state.registration);
-        }
-      });
-    } catch (error) {
-      let message = error instanceof Error ? error.message : 'Unable to load ADS-B data.';
-      if (/429|rate-limit/i.test(message)) message = 'Live update delayed. Keeping the last known positions.';
-
-      const checkedAt = Date.now();
-      const failedStates: Record<string, AircraftState> = {};
-      for (const registration of registrations) {
-        const previous = previousStates[registration];
-        const hasLastPosition = previous.lat !== null && previous.lon !== null;
-        failedStates[registration] = {
-          ...previous,
-          status: hasLastPosition ? 'stale' : 'error',
-          error: hasLastPosition ? `Live update delayed. ${message}` : message,
-          lastCheckedAt: checkedAt,
-        };
-      }
-      aircraftByReg = { ...aircraftByReg, ...failedStates };
-      Object.values(failedStates).forEach(renderAircraft);
     } finally {
       refreshing = false;
     }
@@ -703,44 +652,6 @@
     });
   };
 
-  const animateMarkerTo = (registration: string, marker: any, destination: LatLonTuple): void => {
-    const previousAnimation = markerAnimations.get(registration);
-    if (previousAnimation !== undefined) cancelAnimationFrame(previousAnimation);
-
-    const start = marker.getLatLng();
-    const startLat = Number(start.lat);
-    const startLon = Number(start.lng);
-    const endLat = destination[0];
-    const endLon = destination[1];
-
-    // Small smooth movement between ADS-B updates. The Leaflet marker itself is
-    // never CSS-transformed by us, so zooming/panning cannot throw it across the map.
-    if (!Number.isFinite(startLat) || !Number.isFinite(startLon) ||
-        (Math.abs(startLat - endLat) < 0.000001 && Math.abs(startLon - endLon) < 0.000001)) {
-      marker.setLatLng(destination);
-      return;
-    }
-
-    const startedAt = performance.now();
-    const durationMs = 900;
-
-    const step = (now: number): void => {
-      const progress = Math.min(1, (now - startedAt) / durationMs);
-      const eased = 1 - Math.pow(1 - progress, 3);
-      const lat = startLat + (endLat - startLat) * eased;
-      const lon = startLon + (endLon - startLon) * eased;
-      marker.setLatLng([lat, lon]);
-
-      if (progress < 1) {
-        markerAnimations.set(registration, requestAnimationFrame(step));
-      } else {
-        markerAnimations.delete(registration);
-        marker.setLatLng(destination);
-      }
-    };
-
-    markerAnimations.set(registration, requestAnimationFrame(step));
-  };
 
   const renderAircraft = (state: AircraftState): void => {
     if (state.lat === null || state.lon === null) return;
@@ -752,11 +663,16 @@
       marker.on('click', () => selectAircraft(state.registration, true));
       markers.set(state.registration, marker);
     } else {
+      // Let Windy/Leaflet own marker positioning. Custom animation was fighting
+      // the map's zoom transform and could throw the icon across the screen.
+      marker.setLatLng(point);
       marker.setIcon(makeAircraftIcon(state));
-      animateMarkerTo(state.registration, marker, point);
     }
 
-    const trailLatLngs = state.trail.map(point => [point[0], point[1]] as LatLonTuple);
+    // Keep the visible line physically attached to the live aircraft marker even
+    // when the historical trace endpoint is a few samples behind.
+    const displayTrail = trailWithLivePoint(state.trail, state);
+    const trailLatLngs = displayTrail.map(point => [point[0], point[1]] as LatLonTuple);
     let casing = trailCasings.get(state.registration);
     let line = trailLines.get(state.registration);
     if (state.trailVisible && trailLatLngs.length > 1) {
@@ -808,11 +724,6 @@
   };
 
   const removeMapFeatures = (registration: string): void => {
-    const animation = markerAnimations.get(registration);
-    if (animation !== undefined) {
-      cancelAnimationFrame(animation);
-      markerAnimations.delete(registration);
-    }
     const marker = markers.get(registration);
     if (marker) {
       map.removeLayer(marker);
@@ -876,6 +787,21 @@
     map.fitBounds(L.latLngBounds(points), { padding: [40, 40], maxZoom: 8 });
   };
 
+  const reapplyMarkersAfterZoom = (): void => {
+    if (zoomFixTimer !== undefined) window.clearTimeout(zoomFixTimer);
+    // Windy's Leaflet GL marker positioning finishes after the zoom event. Reapply
+    // our inner aircraft rotation/anchor just after that internal update.
+    zoomFixTimer = window.setTimeout(() => {
+      for (const state of Object.values(aircraftByReg)) {
+        if (state.lat === null || state.lon === null) continue;
+        const marker = markers.get(state.registration);
+        if (!marker) continue;
+        marker.setLatLng([state.lat, state.lon]);
+        marker.setIcon(makeAircraftIcon(state));
+      }
+    }, 120);
+  };
+
   const formatAltitude = (altitude: number | string | null): string => {
     if (altitude === null) return '—';
     if (typeof altitude === 'string') return altitude.toUpperCase();
@@ -903,12 +829,13 @@
     aircraftByReg = Object.fromEntries(registrations.map(reg => [reg, emptyState(reg)]));
     void refreshFleet();
     refreshTimer = window.setInterval(() => void refreshFleet(), POLL_MS);
+    map.on('zoomend', reapplyMarkersAfterZoom);
   });
 
   onDestroy(() => {
     if (refreshTimer !== undefined) window.clearInterval(refreshTimer);
-    markerAnimations.forEach(animation => cancelAnimationFrame(animation));
-    markerAnimations.clear();
+    if (zoomFixTimer !== undefined) window.clearTimeout(zoomFixTimer);
+    map.off('zoomend', reapplyMarkersAfterZoom);
     markers.forEach(marker => map.removeLayer(marker));
     trailCasings.forEach(line => map.removeLayer(line));
     trailLines.forEach(line => map.removeLayer(line));

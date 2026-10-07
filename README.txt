@@ -1,19 +1,14 @@
-AAZ Fleet v0.1.5
+AAZ Fleet v0.1.8
 
-Root-file layout only. Upload/replace these files at the root of the GitHub repository.
+Root-file build for easy GitHub upload.
 
-Changes in 0.1.5:
-- Fix: typing F (or other keys) in the registration box no longer triggers Windy keyboard shortcuts.
-- Thinner aircraft trails (orange line with a smaller dark casing).
-- Live ADS-B refreshes are sequential instead of simultaneous to reduce 429 errors.
-- Automatic fallback to a second free CORS relay if the first relay/upstream is temporarily rate-limited.
-- If an update fails or no new position is returned, the last known aircraft marker/trail stays visible.
-- Short marker transition makes new ADS-B positions visibly move on the map.
-- Auto refresh every 20 seconds.
-- Generic wording: supports any aircraft registration, not only King Airs.
-- Plane heading is refreshed from ADS-B track on every successful update.
+Fixes in this release:
+- Restores reliable one-aircraft-at-a-time ADS-B polling instead of the failing bulk lookup.
+- Rotates across multiple CORS relays if one is unavailable.
+- Removes custom marker movement animation that conflicted with Windy zooming.
+- Reapplies marker heading/anchor after zoom.
+- Keeps the current-flight trail attached to the aircraft's latest live position.
+- Uses readsb's new-leg flag to start the trail at the current flight leg.
+- Trail cache key bumped to avoid old incorrect route data.
 
-No src folder and no dist folder should be uploaded manually. GitHub Actions creates dist during publishing.
-
-
-v0.1.6: fixed Leaflet marker zoom/pan drift, added safe smooth movement, slimmer trails, and stale-state handling when ADS-B refresh fails.
+Upload/replace the files at the ROOT of the GitHub repository, commit, then run publish-plugin.
