@@ -14,7 +14,7 @@ import { transformCodeToESMPlugin, keyPEM, certificatePEM } from '@windycom/plug
 const useSourceMaps = true;
 
 export default {
-  input: 'src/plugin.svelte',
+  input: 'plugin.svelte',
   output: [
     {
       file: 'dist/plugin.js',
@@ -30,7 +30,7 @@ export default {
   onwarn: () => {},
   external: id => id.startsWith('@windy/'),
   watch: {
-    include: ['src/**'],
+    include: ['plugin.svelte', 'pluginConfig.ts'],
     exclude: 'node_modules/**',
     clearScreen: false,
   },
