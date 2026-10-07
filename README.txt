@@ -14,3 +14,6 @@ Changes in 0.1.5:
 - Plane heading is refreshed from ADS-B track on every successful update.
 
 No src folder and no dist folder should be uploaded manually. GitHub Actions creates dist during publishing.
+
+
+v0.1.6: fixed Leaflet marker zoom/pan drift, added safe smooth movement, slimmer trails, and stale-state handling when ADS-B refresh fails.

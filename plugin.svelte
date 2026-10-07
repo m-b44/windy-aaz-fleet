@@ -80,7 +80,7 @@
     {/each}
   </div>
 
-  <div class="footer-note">Auto refresh every 20 seconds · Trails load the current flight from adsb.lol when enabled.</div>
+  <div class="footer-note">Auto refresh every 20 seconds · Trails show the current flight leg from adsb.lol when enabled.</div>
 </section>
 
 <script lang="ts">
@@ -127,6 +127,7 @@
     lon: number;
     timestamp: number;
     ground: boolean;
+    newLeg: boolean;
   };
 
   type AircraftState = {
@@ -160,6 +161,7 @@
   let registrations: string[] = [];
   let aircraftByReg: Record<string, AircraftState> = {};
   let markers = new Map<string, any>();
+  let markerAnimations = new Map<string, number>();
   let trailLines = new Map<string, any>();
   let trailCasings = new Map<string, any>();
   let refreshTimer: number | undefined;
@@ -405,6 +407,9 @@
           lon,
           timestamp: base + offset * 1000,
           ground: typeof row[3] === 'string' && row[3].toLowerCase() === 'ground',
+          // readsb sets bit 2 in the trace flags when it detects the start of a new flight leg.
+          // Using this is much more reliable than guessing from time gaps/ground points.
+          newLeg: (Number(row[6]) & 2) !== 0,
         } as TraceSample;
       })
       .filter((point): point is TraceSample => point !== null)
@@ -417,13 +422,28 @@
     const points = samples.filter(point => point.timestamp >= cutoff);
     if (points.length <= 1) return points.map(point => [point.lat, point.lon, point.timestamp]);
 
-    // Anchor on the most recent airborne point. This keeps the just-finished flight
-    // visible after landing instead of reducing the trail to the taxi-in segment.
+    // readsb/tar1090 explicitly marks the start of a new flight leg in trace flags (bit 2).
+    // Start from the MOST RECENT marker so a quick turn at an airport does not join the
+    // previous flight to the current one (the exact issue visible with GOCF).
+    let startIndex = -1;
+    for (let index = points.length - 1; index >= 0; index -= 1) {
+      if (points[index].newLeg) {
+        startIndex = index;
+        break;
+      }
+    }
+
+    if (startIndex >= 0) {
+      return points.slice(startIndex).map(point => [point.lat, point.lon, point.timestamp]);
+    }
+
+    // Fallback for traces that do not contain a leg marker: split at the most recent
+    // meaningful ground/timing break.
     let airborneIndex = points.length - 1;
     while (airborneIndex >= 0 && points[airborneIndex].ground) airborneIndex -= 1;
     if (airborneIndex < 0) return points.slice(-80).map(point => [point.lat, point.lon, point.timestamp]);
 
-    let startIndex = 0;
+    startIndex = 0;
     for (let index = airborneIndex; index > 0; index -= 1) {
       const gap = points[index].timestamp - points[index - 1].timestamp;
       if (gap > MAX_LEG_GAP_MS) {
@@ -555,10 +575,11 @@
       if (/429|rate-limit/i.test(message)) {
         message = 'Live update delayed. Keeping the last known position.';
       }
+      const hasLastPosition = latest.lat !== null && latest.lon !== null;
       const failedState: AircraftState = {
         ...latest,
-        status: 'error',
-        error: message,
+        status: hasLastPosition ? 'stale' : 'error',
+        error: hasLastPosition ? `Live update delayed. ${message}` : message,
         lastCheckedAt: Date.now(),
       };
       aircraftByReg = { ...aircraftByReg, [registration]: failedState };
@@ -567,16 +588,104 @@
     }
   };
 
+  const stateFromAdsbItem = (registration: string, item: AdsbAircraft | undefined, checkedAt: number): AircraftState => {
+    const previous = aircraftByReg[registration] || emptyState(registration);
+
+    if (!item) {
+      const hasLastPosition = previous.lat !== null && previous.lon !== null;
+      return {
+        ...previous,
+        status: hasLastPosition ? 'stale' : 'missing',
+        error: hasLastPosition ? 'No new ADS-B position. Showing the last known position.' : 'No live ADS-B signal right now.',
+        lastCheckedAt: checkedAt,
+      };
+    }
+
+    const position = choosePosition(item);
+    const age = position.seen;
+    const status: AircraftState['status'] = age !== null && age <= 90 ? 'live' : 'stale';
+    const heading = item.track ?? item.true_heading ?? item.mag_heading ?? previous.track;
+
+    return {
+      registration,
+      hex: item.hex || previous.hex,
+      flight: item.flight?.trim() || null,
+      typeCode: item.t || null,
+      lat: position.lat,
+      lon: position.lon,
+      altitude: item.alt_baro ?? item.alt_geom ?? null,
+      groundSpeed: item.gs ?? null,
+      track: heading ?? null,
+      seenPositionSeconds: age,
+      status: position.lat === null ? 'missing' : status,
+      error: position.lat === null ? 'Aircraft found, but no position is available.' : null,
+      lastCheckedAt: checkedAt,
+      trail: updateTrail(previous.trail, item, position.lat, position.lon),
+      trailVisible: previous.trailVisible,
+      trailHistoryLoaded: previous.trailHistoryLoaded,
+      trailHistoryLoading: previous.trailHistoryLoading,
+    };
+  };
+
   const refreshFleet = async (): Promise<void> => {
     if (refreshing || registrations.length === 0) return;
     refreshing = true;
+
+    // One adsb.lol request can match multiple registrations. This avoids sending
+    // one relay/API request per aircraft, which was causing the second aircraft
+    // to time out or hit 429s.
+    const previousStates = Object.fromEntries(registrations.map(registration => [registration, aircraftByReg[registration] || emptyState(registration)]));
+    aircraftByReg = {
+      ...aircraftByReg,
+      ...Object.fromEntries(registrations.map(registration => [registration, { ...previousStates[registration], status: 'loading' as const, error: null }])),
+    };
+
     try {
-      // Do not burst several requests through the public CORS relay at once.
-      // Sequential polling avoids the 429 errors that were stopping marker updates.
-      for (const registration of registrations) {
-        await refreshOne(registration);
-        if (registrations.length > 1) await sleep(1200);
+      const query = registrations.map(adsbRegistration).join(',');
+      const target = `https://api.adsb.lol/v2/reg/${encodeURIComponent(query)}`;
+      const payload = await fetchJsonViaRelay<AdsbResponse>(target);
+      const checkedAt = Date.now();
+      const byRegistration = new Map<string, AdsbAircraft>();
+
+      for (const item of payload.ac || []) {
+        const itemReg = normalizeRegistration(item.r || '');
+        if (itemReg) byRegistration.set(itemReg, item);
       }
+
+      const nextStates: Record<string, AircraftState> = {};
+      for (const registration of registrations) {
+        // In the unlikely case the source omitted the registration field, allow a
+        // single-aircraft response to fall back to its first returned item.
+        const item = byRegistration.get(registration) || (registrations.length === 1 ? payload.ac?.[0] : undefined);
+        nextStates[registration] = stateFromAdsbItem(registration, item, checkedAt);
+      }
+
+      aircraftByReg = { ...aircraftByReg, ...nextStates };
+      saveTrails();
+      Object.values(nextStates).forEach(state => {
+        renderAircraft(state);
+        if (state.trailVisible && state.hex && !state.trailHistoryLoaded && !state.trailHistoryLoading) {
+          void loadFlightTrail(state.registration);
+        }
+      });
+    } catch (error) {
+      let message = error instanceof Error ? error.message : 'Unable to load ADS-B data.';
+      if (/429|rate-limit/i.test(message)) message = 'Live update delayed. Keeping the last known positions.';
+
+      const checkedAt = Date.now();
+      const failedStates: Record<string, AircraftState> = {};
+      for (const registration of registrations) {
+        const previous = previousStates[registration];
+        const hasLastPosition = previous.lat !== null && previous.lon !== null;
+        failedStates[registration] = {
+          ...previous,
+          status: hasLastPosition ? 'stale' : 'error',
+          error: hasLastPosition ? `Live update delayed. ${message}` : message,
+          lastCheckedAt: checkedAt,
+        };
+      }
+      aircraftByReg = { ...aircraftByReg, ...failedStates };
+      Object.values(failedStates).forEach(renderAircraft);
     } finally {
       refreshing = false;
     }
@@ -594,6 +703,45 @@
     });
   };
 
+  const animateMarkerTo = (registration: string, marker: any, destination: LatLonTuple): void => {
+    const previousAnimation = markerAnimations.get(registration);
+    if (previousAnimation !== undefined) cancelAnimationFrame(previousAnimation);
+
+    const start = marker.getLatLng();
+    const startLat = Number(start.lat);
+    const startLon = Number(start.lng);
+    const endLat = destination[0];
+    const endLon = destination[1];
+
+    // Small smooth movement between ADS-B updates. The Leaflet marker itself is
+    // never CSS-transformed by us, so zooming/panning cannot throw it across the map.
+    if (!Number.isFinite(startLat) || !Number.isFinite(startLon) ||
+        (Math.abs(startLat - endLat) < 0.000001 && Math.abs(startLon - endLon) < 0.000001)) {
+      marker.setLatLng(destination);
+      return;
+    }
+
+    const startedAt = performance.now();
+    const durationMs = 900;
+
+    const step = (now: number): void => {
+      const progress = Math.min(1, (now - startedAt) / durationMs);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      const lat = startLat + (endLat - startLat) * eased;
+      const lon = startLon + (endLon - startLon) * eased;
+      marker.setLatLng([lat, lon]);
+
+      if (progress < 1) {
+        markerAnimations.set(registration, requestAnimationFrame(step));
+      } else {
+        markerAnimations.delete(registration);
+        marker.setLatLng(destination);
+      }
+    };
+
+    markerAnimations.set(registration, requestAnimationFrame(step));
+  };
+
   const renderAircraft = (state: AircraftState): void => {
     if (state.lat === null || state.lon === null) return;
     const point: LatLonTuple = [state.lat, state.lon];
@@ -604,8 +752,8 @@
       marker.on('click', () => selectAircraft(state.registration, true));
       markers.set(state.registration, marker);
     } else {
-      marker.setLatLng(point);
       marker.setIcon(makeAircraftIcon(state));
+      animateMarkerTo(state.registration, marker, point);
     }
 
     const trailLatLngs = state.trail.map(point => [point[0], point[1]] as LatLonTuple);
@@ -615,7 +763,7 @@
       if (!casing) {
         casing = new L.Polyline(trailLatLngs, {
           color: '#101214',
-          weight: 6,
+          weight: 3,
           opacity: 0.78,
           lineCap: 'round',
           lineJoin: 'round',
@@ -629,7 +777,7 @@
       if (!line) {
         line = new L.Polyline(trailLatLngs, {
           color: '#ff6a00',
-          weight: 3,
+          weight: 1.5,
           opacity: 1,
           lineCap: 'round',
           lineJoin: 'round',
@@ -660,6 +808,11 @@
   };
 
   const removeMapFeatures = (registration: string): void => {
+    const animation = markerAnimations.get(registration);
+    if (animation !== undefined) {
+      cancelAnimationFrame(animation);
+      markerAnimations.delete(registration);
+    }
     const marker = markers.get(registration);
     if (marker) {
       map.removeLayer(marker);
@@ -754,6 +907,8 @@
 
   onDestroy(() => {
     if (refreshTimer !== undefined) window.clearInterval(refreshTimer);
+    markerAnimations.forEach(animation => cancelAnimationFrame(animation));
+    markerAnimations.clear();
     markers.forEach(marker => map.removeLayer(marker));
     trailCasings.forEach(line => map.removeLayer(line));
     trailLines.forEach(line => map.removeLayer(line));
@@ -963,7 +1118,6 @@
   :global(.aaz-aircraft-marker) {
     background: transparent !important;
     border: 0 !important;
-    transition: transform 650ms linear;
   }
 
   :global(.aaz-marker-wrap) {
