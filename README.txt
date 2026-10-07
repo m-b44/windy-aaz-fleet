@@ -1,14 +1,16 @@
-AAZ Fleet v0.1.4
+AAZ Fleet v0.1.5
 
 Root-file layout only. Upload/replace these files at the root of the GitHub repository.
 
-Changes in 0.1.4:
-- Per-aircraft Show trail / Hide trail control.
-- Trail is OFF by default for each aircraft and the preference is remembered.
-- When enabled, the plugin loads adsb.lol's current full trace and trims it to the most recent flight leg (from takeoff / most recent leg).
-- Live positions continue extending the trail every 15 seconds.
-- Thicker high-contrast orange trail with dark casing.
-- Proper north-facing SVG aircraft icon rotated by ADS-B track.
-- No C- prefix required when entering Canadian registrations (example: GOCF, GABI).
+Changes in 0.1.5:
+- Fix: typing F (or other keys) in the registration box no longer triggers Windy keyboard shortcuts.
+- Thinner aircraft trails (orange line with a smaller dark casing).
+- Live ADS-B refreshes are sequential instead of simultaneous to reduce 429 errors.
+- Automatic fallback to a second free CORS relay if the first relay/upstream is temporarily rate-limited.
+- If an update fails or no new position is returned, the last known aircraft marker/trail stays visible.
+- Short marker transition makes new ADS-B positions visibly move on the map.
+- Auto refresh every 20 seconds.
+- Generic wording: supports any aircraft registration, not only King Airs.
+- Plane heading is refreshed from ADS-B track on every successful update.
 
 No src folder and no dist folder should be uploaded manually. GitHub Actions creates dist during publishing.

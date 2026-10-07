@@ -15,14 +15,16 @@
       aria-label="Aircraft registration"
       placeholder="GABC"
       bind:value={newRegistration}
-      on:keydown={(event) => event.key === 'Enter' && addRegistration()}
+      on:keydown={handleRegistrationKeydown}
+      on:keyup={stopRegistrationKeyboardEvent}
+      on:keypress={stopRegistrationKeyboardEvent}
     />
     <button class="add-button" on:click={addRegistration}>Add</button>
   </div>
 
   {#if registrations.length === 0}
     <div class="empty-state">
-      Add a King Air registration above (example: GABI). Positions come from adsb.lol.
+      Add an aircraft registration above (example: GABI). Positions come from adsb.lol.
     </div>
   {/if}
 
@@ -78,7 +80,7 @@
     {/each}
   </div>
 
-  <div class="footer-note">Auto refresh every 15 seconds · Trails load the current flight from adsb.lol when enabled.</div>
+  <div class="footer-note">Auto refresh every 20 seconds · Trails load the current flight from adsb.lol when enabled.</div>
 </section>
 
 <script lang="ts">
@@ -150,7 +152,7 @@
   const STORAGE_KEY = 'windy-aaz-fleet-registrations-v1';
   const TRAIL_STORAGE_KEY = 'windy-aaz-fleet-trails-v3';
   const TRAIL_PREFS_STORAGE_KEY = 'windy-aaz-fleet-trail-prefs-v1';
-  const POLL_MS = 15_000;
+  const POLL_MS = 20_000;
   const MAX_TRAIL_POINTS = 3000;
   const MAX_TRAIL_AGE_MS = 12 * 60 * 60 * 1000;
   const MAX_LEG_GAP_MS = 45 * 60 * 1000;
@@ -168,6 +170,19 @@
   let trailPreferences: Record<string, boolean> = {};
 
   $: hasPositions = Object.values(aircraftByReg).some(a => a.lat !== null && a.lon !== null);
+
+  const sleep = (ms: number): Promise<void> => new Promise(resolve => window.setTimeout(resolve, ms));
+
+  const stopRegistrationKeyboardEvent = (event: KeyboardEvent): void => {
+    // Windy has global keyboard shortcuts (notably F for search).
+    // Keep keystrokes typed in this input inside the plugin.
+    event.stopPropagation();
+  };
+
+  const handleRegistrationKeydown = (event: KeyboardEvent): void => {
+    event.stopPropagation();
+    if (event.key === 'Enter') addRegistration();
+  };
 
   const normalizeRegistration = (value: string): string => {
     let normalized = value.trim().toUpperCase().replace(/\s+/g, '').replace(/-/g, '');
@@ -336,24 +351,43 @@
   };
 
   async function fetchJsonViaRelay<T>(target: string, timeoutMs = 11_000): Promise<T> {
-    const relayUrl = `https://proxy.cors.dev/?url=${encodeURIComponent(target)}`;
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+    const relayUrls = [
+      `https://proxy.cors.dev/?url=${encodeURIComponent(target)}`,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`,
+    ];
+    let lastError: Error | null = null;
 
-    try {
-      const response = await fetch(relayUrl, {
-        credentials: 'omit',
-        cache: 'no-store',
-        signal: controller.signal,
-      });
-      if (!response.ok) {
+    // adsb.lol does not expose browser CORS headers. Use cors.dev first and
+    // automatically fall back to AllOrigins if the shared relay/upstream is rate-limited.
+    for (let index = 0; index < relayUrls.length; index += 1) {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const response = await fetch(relayUrls[index], {
+          credentials: 'omit',
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+
+        if (response.ok) return (await response.json()) as T;
+
         const relayError = response.headers.get('X-Cors-Error');
-        throw new Error(relayError || `Request failed (${response.status}).`);
+        lastError = new Error(relayError || `Request failed (${response.status}).`);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          lastError = new Error('ADS-B lookup timed out.');
+        } else {
+          lastError = error instanceof Error ? error : new Error('Unable to load ADS-B data.');
+        }
+      } finally {
+        window.clearTimeout(timeout);
       }
-      return (await response.json()) as T;
-    } finally {
-      window.clearTimeout(timeout);
+
+      if (index < relayUrls.length - 1) await sleep(500);
     }
+
+    throw lastError || new Error('Unable to load ADS-B data.');
   }
 
   const traceSamples = (payload: AdsbTraceResponse): TraceSample[] => {
@@ -459,12 +493,11 @@
       const checkedAt = Date.now();
 
       if (!item) {
+        const hasLastPosition = previous.lat !== null && previous.lon !== null;
         return {
           ...previous,
-          lat: null,
-          lon: null,
-          status: 'missing',
-          error: 'No live ADS-B signal right now.',
+          status: hasLastPosition ? 'stale' : 'missing',
+          error: hasLastPosition ? 'No new ADS-B position. Showing the last known position.' : 'No live ADS-B signal right now.',
           lastCheckedAt: checkedAt,
         };
       }
@@ -518,16 +551,19 @@
       }
     } catch (error) {
       const latest = aircraftByReg[registration] || previous;
-      const message = error instanceof Error ? error.message : 'Unable to load ADS-B data.';
-      aircraftByReg = {
-        ...aircraftByReg,
-        [registration]: {
-          ...latest,
-          status: 'error',
-          error: message,
-          lastCheckedAt: Date.now(),
-        },
+      let message = error instanceof Error ? error.message : 'Unable to load ADS-B data.';
+      if (/429|rate-limit/i.test(message)) {
+        message = 'Live update delayed. Keeping the last known position.';
+      }
+      const failedState: AircraftState = {
+        ...latest,
+        status: 'error',
+        error: message,
+        lastCheckedAt: Date.now(),
       };
+      aircraftByReg = { ...aircraftByReg, [registration]: failedState };
+      // Keep the existing marker/trail visible even if one refresh fails.
+      renderAircraft(failedState);
     }
   };
 
@@ -535,7 +571,12 @@
     if (refreshing || registrations.length === 0) return;
     refreshing = true;
     try {
-      await Promise.all(registrations.map(registration => refreshOne(registration)));
+      // Do not burst several requests through the public CORS relay at once.
+      // Sequential polling avoids the 429 errors that were stopping marker updates.
+      for (const registration of registrations) {
+        await refreshOne(registration);
+        if (registrations.length > 1) await sleep(1200);
+      }
     } finally {
       refreshing = false;
     }
@@ -574,7 +615,7 @@
       if (!casing) {
         casing = new L.Polyline(trailLatLngs, {
           color: '#101214',
-          weight: 10,
+          weight: 6,
           opacity: 0.78,
           lineCap: 'round',
           lineJoin: 'round',
@@ -588,7 +629,7 @@
       if (!line) {
         line = new L.Polyline(trailLatLngs, {
           color: '#ff6a00',
-          weight: 5,
+          weight: 3,
           opacity: 1,
           lineCap: 'round',
           lineJoin: 'round',
@@ -922,6 +963,7 @@
   :global(.aaz-aircraft-marker) {
     background: transparent !important;
     border: 0 !important;
+    transition: transform 650ms linear;
   }
 
   :global(.aaz-marker-wrap) {
