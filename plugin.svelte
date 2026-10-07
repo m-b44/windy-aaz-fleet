@@ -114,7 +114,7 @@
     {/each}
   </div>
 
-  <div class="footer-note">Auto refresh every 20 seconds · One live request for the whole fleet · Trails show the current flight from takeoff.<br />Data: <a href="https://www.adsb.lol/" target="_blank" rel="noreferrer">adsb.lol</a> · fallback: <a href="https://adsb.fi/" target="_blank" rel="noreferrer">adsb.fi</a></div>
+  <div class="footer-note">Auto refresh every 20 seconds · One relay request for the whole fleet · Trails show the current flight from takeoff.<br />Data: <a href="https://www.adsb.lol/" target="_blank" rel="noreferrer">adsb.lol</a> · fallback: <a href="https://adsb.fi/" target="_blank" rel="noreferrer">adsb.fi</a></div>
 </section>
 
 <script lang="ts">

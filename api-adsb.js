@@ -1,4 +1,4 @@
-const USER_AGENT = 'AAZ-Fleet/0.1.9 (+https://www.aazaviation.com/)';
+const USER_AGENT = 'AAZ-Fleet/0.1.10 (+https://www.aazaviation.com/)';
 const MAX_REGISTRATIONS = 12;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -10,7 +10,7 @@ const responseHeaders = {
   'Content-Type': 'application/json; charset=utf-8',
 };
 
-const fetchJson = async (url, timeoutMs = 7000) => {
+const fetchJson = async (url, timeoutMs = 5000) => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -51,54 +51,61 @@ const normalizeAircraftList = payload => {
   return [];
 };
 
-const fetchAdsbLolBatch = async registrations => {
-  const path = registrations.map(encodeURIComponent).join(',');
-  const payload = await fetchJson(`https://api.adsb.lol/v2/reg/${path}`);
+const registrationKey = value => String(value || '').toUpperCase().replace(/-/g, '');
+
+const fetchAdsbLolOne = async registration => {
+  const payload = await fetchJson(`https://api.adsb.lol/v2/reg/${encodeURIComponent(registration)}`, 5000);
   return normalizeAircraftList(payload);
 };
 
 const fetchAdsbFiOne = async registration => {
-  const payload = await fetchJson(`https://opendata.adsb.fi/api/v2/registration/${encodeURIComponent(registration)}`);
+  const payload = await fetchJson(`https://opendata.adsb.fi/api/v2/registration/${encodeURIComponent(registration)}`, 5000);
   return normalizeAircraftList(payload);
 };
 
-const registrationKey = value => String(value || '').toUpperCase().replace(/-/g, '');
+const addMatchingAircraft = (map, registration, items) => {
+  const wanted = registrationKey(registration);
+  for (const aircraft of items) {
+    const key = registrationKey(aircraft?.r);
+    if (key && key === wanted) map.set(key, aircraft);
+  }
+  return map.has(wanted);
+};
 
 const fetchLiveFleet = async registrations => {
   const warnings = [];
-  let primary = [];
-
-  try {
-    primary = await fetchAdsbLolBatch(registrations);
-  } catch (error) {
-    warnings.push(`adsb.lol: ${error instanceof Error ? error.message : 'failed'}`);
-  }
-
   const byRegistration = new Map();
-  for (const aircraft of primary) {
-    if (aircraft?.r) byRegistration.set(registrationKey(aircraft.r), aircraft);
-  }
+  let adsbFiCalls = 0;
 
-  const missing = registrations.filter(reg => !byRegistration.has(registrationKey(reg)));
+  // adsb.lol documents one registration per /v2/reg/{registration} request.
+  // The Windy plugin still makes only one request to this relay; the relay
+  // performs the provider lookups server-side and returns one combined payload.
+  for (const registration of registrations) {
+    let found = false;
 
-  // adsb.fi is only a fallback. Its public API asks clients to stay at or below
-  // one request per second, so missing registrations are queried sequentially.
-  for (let index = 0; index < missing.length; index += 1) {
-    const registration = missing[index];
     try {
-      const items = await fetchAdsbFiOne(registration);
-      for (const aircraft of items) {
-        if (aircraft?.r) byRegistration.set(registrationKey(aircraft.r), aircraft);
-      }
+      const items = await fetchAdsbLolOne(registration);
+      found = addMatchingAircraft(byRegistration, registration, items);
     } catch (error) {
-      warnings.push(`adsb.fi ${registration}: ${error instanceof Error ? error.message : 'failed'}`);
+      warnings.push(`adsb.lol ${registration}: ${error instanceof Error ? error.message : 'failed'}`);
     }
-    if (index < missing.length - 1) await sleep(1050);
+
+    if (!found) {
+      // adsb.fi's public API is limited to 1 request/second. Space fallback calls.
+      if (adsbFiCalls > 0) await sleep(1050);
+      adsbFiCalls += 1;
+      try {
+        const items = await fetchAdsbFiOne(registration);
+        addMatchingAircraft(byRegistration, registration, items);
+      } catch (error) {
+        warnings.push(`adsb.fi ${registration}: ${error instanceof Error ? error.message : 'failed'}`);
+      }
+    }
   }
 
   return {
     ac: [...byRegistration.values()],
-    source: missing.length ? 'adsb.lol + adsb.fi fallback' : 'adsb.lol',
+    source: 'adsb.lol with adsb.fi fallback',
     warnings,
   };
 };

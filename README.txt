@@ -1,4 +1,4 @@
-AAZ Fleet v0.1.9
+AAZ Fleet v0.1.10
 
 ROOT FILE METHOD
 - Upload/replace all files in this folder at the ROOT of the GitHub repo.
