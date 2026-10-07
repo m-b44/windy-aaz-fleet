@@ -80,7 +80,7 @@
     {/each}
   </div>
 
-  <div class="footer-note">Auto refresh every 20 seconds · Aircraft are queried one at a time · Trails show the current flight from takeoff.</div>
+  <div class="footer-note">Auto refresh every 20 seconds · Any registration · Exact lookups are queried one at a time · Trails show the current flight from takeoff.</div>
 </section>
 
 <script lang="ts">
@@ -154,8 +154,7 @@
   const TRAIL_STORAGE_KEY = 'windy-aaz-fleet-trails-v4';
   const TRAIL_PREFS_STORAGE_KEY = 'windy-aaz-fleet-trail-prefs-v1';
   const POLL_MS = 20_000;
-  const LIVE_TYPE_CODES = ['BE10', 'PA31'];
-  const TYPE_REQUEST_GAP_MS = 700;
+  const REGISTRATION_REQUEST_GAP_MS = 1_100;
   const MAX_TRAIL_POINTS = 3000;
   const MAX_TRAIL_AGE_MS = 12 * 60 * 60 * 1000;
   const MAX_LEG_GAP_MS = 45 * 60 * 1000;
@@ -188,14 +187,16 @@
   };
 
   const normalizeRegistration = (value: string): string => {
-    let normalized = value.trim().toUpperCase().replace(/\s+/g, '').replace(/-/g, '');
-    // Canadian registrations can be entered as GABI instead of C-GABI.
-    if (/^C[FGI][A-Z0-9]{3}$/.test(normalized)) normalized = normalized.slice(1);
+    let normalized = value.trim().toUpperCase().replace(/\s+/g, '');
+    // Canadian registrations can be entered as GABI or C-GABI; display them as GABI.
+    const canadian = normalized.replace(/-/g, '');
+    if (/^C[FGI][A-Z0-9]{3}$/.test(canadian)) return canadian.slice(1);
+    // Preserve hyphens for every other country so exact registrations such as G-KELS work.
     return normalized;
   };
 
   const adsbRegistration = (value: string): string => {
-    // AAZ Canadian marks are stored/displayed without the C- prefix.
+    // Canadian marks can be entered without the C- prefix. Everything else is sent exactly as entered.
     if (/^[FGI][A-Z0-9]{3}$/.test(value)) return `C-${value}`;
     return value;
   };
@@ -299,7 +300,7 @@
     aircraftByReg = { ...aircraftByReg, [registration]: emptyState(registration) };
     newRegistration = '';
     saveRegistrations();
-    void refreshOne(registration);
+    if (!refreshing) void refreshFleet();
   };
 
   const removeRegistration = (registration: string): void => {
@@ -353,35 +354,41 @@
     return [...next, [lat, lon, now] as TrailPoint].slice(-MAX_TRAIL_POINTS);
   };
 
-  async function fetchJsonViaRelay<T>(target: string, timeoutMs = 9_000): Promise<T> {
-    // adsb.lol is public but does not expose browser CORS headers. cors.dev's
-    // free GET proxy needs no account or API key, so the plugin stays browser-only.
-    const url = `https://proxy.cors.dev/${target}`;
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  async function fetchJsonViaRelay<T>(target: string, timeoutMs = 8_000): Promise<T> {
+    // Browser-only, no account/server required. Use two keyless relays in fallback order.
+    const urls = [
+      `https://proxy.cors.dev/${target}`,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`,
+    ];
+    let lastError: Error | null = null;
 
-    try {
-      const response = await fetch(url, {
-        credentials: 'omit',
-        cache: 'no-store',
-        signal: controller.signal,
-        headers: { Accept: 'application/json' },
-      });
-
-      if (!response.ok) {
-        const relayError = response.headers.get('X-Cors-Error');
-        throw new Error(relayError || `Request failed (${response.status}).`);
+    for (const url of urls) {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, {
+          credentials: 'omit',
+          cache: 'no-store',
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        });
+        if (!response.ok) {
+          const relayError = response.headers.get('X-Cors-Error');
+          throw new Error(relayError || `Request failed (${response.status}).`);
+        }
+        return (await response.json()) as T;
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          lastError = new Error('ADS-B lookup timed out.');
+        } else {
+          lastError = error instanceof Error ? error : new Error('Unable to load ADS-B data.');
+        }
+      } finally {
+        window.clearTimeout(timeout);
       }
-
-      return (await response.json()) as T;
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        throw new Error('ADS-B lookup timed out.');
-      }
-      throw error instanceof Error ? error : new Error('Unable to load ADS-B data.');
-    } finally {
-      window.clearTimeout(timeout);
     }
+
+    throw lastError || new Error('Unable to load ADS-B data.');
   }
 
   const traceSamples = (payload: AdsbTraceResponse): TraceSample[] => {
@@ -554,132 +561,69 @@
 
   const fetchAdsb = async (registration: string): Promise<AircraftState> => {
     const apiRegistration = adsbRegistration(registration);
-    const target = `https://api.adsb.lol/v2/reg/${encodeURIComponent(apiRegistration)}`;
-    const payload = await fetchJsonViaRelay<AdsbResponse>(target);
-    return stateFromAdsbItem(registration, payload.ac?.[0], Date.now());
-  };
+    const sources = [
+      `https://api.adsb.lol/v2/reg/${encodeURIComponent(apiRegistration)}`,
+      `https://api.airplanes.live/v2/reg/${encodeURIComponent(apiRegistration)}`,
+    ];
+    let lastError: Error | null = null;
 
-  const refreshOne = async (registration: string): Promise<void> => {
-    const previous = aircraftByReg[registration] || emptyState(registration);
-    aircraftByReg = {
-      ...aircraftByReg,
-      [registration]: { ...previous, status: 'loading', error: null },
-    };
-
-    try {
-      const state = await fetchAdsb(registration);
-      aircraftByReg = { ...aircraftByReg, [registration]: state };
-      saveTrails();
-      renderAircraft(state);
-      if (state.trailVisible && state.hex && !state.trailHistoryLoaded && !state.trailHistoryLoading) {
-        void loadFlightTrail(registration);
+    for (const target of sources) {
+      try {
+        const payload = await fetchJsonViaRelay<AdsbResponse>(target);
+        if (payload.ac && payload.ac.length > 0) {
+          return stateFromAdsbItem(registration, payload.ac[0], Date.now());
+        }
+      } catch (error) {
+        lastError = error instanceof Error ? error : lastError;
       }
-    } catch (error) {
-      const latest = aircraftByReg[registration] || previous;
-      let message = error instanceof Error ? error.message : 'Unable to load ADS-B data.';
-      if (/429|rate-limit/i.test(message)) {
-        message = 'Live update delayed. Keeping the last known position.';
-      }
-      const hasLastPosition = latest.lat !== null && latest.lon !== null;
-      const failedState: AircraftState = {
-        ...latest,
-        status: hasLastPosition ? 'stale' : 'error',
-        error: hasLastPosition ? `Live update delayed. ${message}` : message,
-        lastCheckedAt: Date.now(),
-      };
-      aircraftByReg = { ...aircraftByReg, [registration]: failedState };
-      // Keep the existing marker/trail visible even if one refresh fails.
-      renderAircraft(failedState);
     }
+
+    if (lastError) throw lastError;
+    return stateFromAdsbItem(registration, undefined, Date.now());
   };
 
   const refreshFleet = async (): Promise<void> => {
     if (refreshing || registrations.length === 0) return;
     refreshing = true;
 
-    const previousStates = Object.fromEntries(
-      registrations.map(registration => [registration, aircraftByReg[registration] || emptyState(registration)])
-    );
-    aircraftByReg = {
-      ...aircraftByReg,
-      ...Object.fromEntries(
-        registrations.map(registration => [registration, { ...previousStates[registration], status: 'loading' as const, error: null }])
-      ),
-    };
-
-    const byRegistration = new Map<string, AdsbAircraft>();
-    const byHex = new Map<string, AdsbAircraft>();
-    const successfulTypes = new Set<string>();
-    let lastFeedError: Error | null = null;
-
     try {
-      // AAZ currently tracks B100s (BE10) and Navajos (PA31). Fetching each type
-      // once gives us all tracked aircraft with only two public API calls, avoiding
-      // the rate-limit/time-out problem caused by one request per aircraft.
-      for (let index = 0; index < LIVE_TYPE_CODES.length; index += 1) {
-        const typeCode = LIVE_TYPE_CODES[index];
+      // Exact-registration lookups only: no aircraft-type assumptions.
+      // Requests are deliberately serialized so any registration can be tracked
+      // without the simultaneous-request failures seen in earlier builds.
+      for (let index = 0; index < registrations.length; index += 1) {
+        const registration = registrations[index];
+        const previous = aircraftByReg[registration] || emptyState(registration);
+        aircraftByReg = {
+          ...aircraftByReg,
+          [registration]: { ...previous, status: 'loading', error: null },
+        };
+
         try {
-          const target = `https://api.adsb.lol/v2/type/${encodeURIComponent(typeCode)}`;
-          const payload = await fetchJsonViaRelay<AdsbResponse>(target);
-          successfulTypes.add(typeCode);
-          for (const item of payload.ac || []) {
-            const reg = normalizeRegistration(item.r || '');
-            if (reg) byRegistration.set(reg, item);
-            if (item.hex) byHex.set(item.hex.toLowerCase(), item);
+          const state = await fetchAdsb(registration);
+          aircraftByReg = { ...aircraftByReg, [registration]: state };
+          saveTrails();
+          renderAircraft(state);
+          if (state.trailVisible && state.hex && !state.trailHistoryLoaded && !state.trailHistoryLoading) {
+            void loadFlightTrail(registration);
           }
         } catch (error) {
-          lastFeedError = error instanceof Error ? error : new Error('Unable to load ADS-B data.');
-        }
-        if (index < LIVE_TYPE_CODES.length - 1) await sleep(TYPE_REQUEST_GAP_MS);
-      }
-
-      const checkedAt = Date.now();
-      const nextStates: Record<string, AircraftState> = {};
-
-      for (const registration of registrations) {
-        const previous = previousStates[registration];
-        let item = byRegistration.get(registration);
-        if (!item && previous.hex) item = byHex.get(previous.hex.toLowerCase());
-
-        if (item) {
-          nextStates[registration] = stateFromAdsbItem(registration, item, checkedAt);
-          continue;
-        }
-
-        const expectedType = previous.typeCode?.toUpperCase() || null;
-        if (expectedType && LIVE_TYPE_CODES.includes(expectedType) && !successfulTypes.has(expectedType)) {
-          const hasLastPosition = previous.lat !== null && previous.lon !== null;
-          nextStates[registration] = {
-            ...previous,
+          const latest = aircraftByReg[registration] || previous;
+          const message = error instanceof Error ? error.message : 'Unable to load ADS-B data.';
+          const hasLastPosition = latest.lat !== null && latest.lon !== null;
+          const failedState: AircraftState = {
+            ...latest,
             status: hasLastPosition ? 'stale' : 'error',
-            error: hasLastPosition ? 'Live update delayed. Keeping the last known position.' : (lastFeedError?.message || 'ADS-B feed temporarily unavailable.'),
-            lastCheckedAt: checkedAt,
+            error: hasLastPosition ? 'Live update delayed. Keeping the last known position.' : message,
+            lastCheckedAt: Date.now(),
           };
-          continue;
+          aircraftByReg = { ...aircraftByReg, [registration]: failedState };
+          renderAircraft(failedState);
         }
 
-        // For a newly added registration whose type is not known yet, do one exact
-        // lookup. Once found, future refreshes use the shared BE10/PA31 feeds.
-        if (!previous.hex && !previous.typeCode) {
-          try {
-            nextStates[registration] = await fetchAdsb(registration);
-            continue;
-          } catch (error) {
-            lastFeedError = error instanceof Error ? error : lastFeedError;
-          }
+        if (index < registrations.length - 1) {
+          await sleep(REGISTRATION_REQUEST_GAP_MS);
         }
-
-        nextStates[registration] = stateFromAdsbItem(registration, undefined, checkedAt);
       }
-
-      aircraftByReg = { ...aircraftByReg, ...nextStates };
-      saveTrails();
-      Object.values(nextStates).forEach(state => {
-        renderAircraft(state);
-        if (state.trailVisible && state.hex && !state.trailHistoryLoaded && !state.trailHistoryLoading) {
-          void loadFlightTrail(state.registration);
-        }
-      });
     } finally {
       refreshing = false;
     }
