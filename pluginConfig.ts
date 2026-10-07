@@ -2,7 +2,7 @@ import type { ExternalPluginConfig } from '@windy/interfaces';
 
 const config: ExternalPluginConfig = {
   name: 'windy-plugin-aaz-fleet',
-  version: '0.1.8',
+  version: '0.1.9',
   icon: '✈️',
   title: 'AAZ Fleet',
   description: 'Live aircraft tracking on Windy using adsb.lol.',

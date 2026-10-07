@@ -1,7 +1,7 @@
 {
   "name": "windy-plugin-aaz-fleet",
-  "version": "0.1.8",
-  "description": "Private Windy plugin for live AAZ aircraft tracking via adsb.lol",
+  "version": "0.1.9",
+  "description": "Private Windy plugin for live aircraft tracking using adsb.lol",
   "main": "dist/plugin.min.js",
   "type": "module",
   "scripts": {

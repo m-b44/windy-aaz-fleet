@@ -6,9 +6,33 @@
   </div>
 
   <div class="toolbar">
-    <button class="action" on:click={refreshFleet} disabled={refreshing}>Refresh</button>
+    <button class="action" on:click={refreshFleet} disabled={refreshing || !relayBase}>Refresh</button>
     <button class="action" on:click={fitAll} disabled={!hasPositions}>Fit all</button>
   </div>
+
+  {#if !relayBase || editingRelay}
+    <div class="relay-card">
+      <div class="relay-title">Data relay</div>
+      <div class="relay-copy">Paste your Vercel relay URL once. This replaces the unreliable public CORS proxies.</div>
+      <div class="relay-row">
+        <input
+          aria-label="Data relay URL"
+          placeholder="https://windy-aaz-fleet.vercel.app"
+          bind:value={relayInput}
+          on:keydown={stopKeyboardEvent}
+          on:keyup={stopKeyboardEvent}
+          on:keypress={stopKeyboardEvent}
+        />
+        <button class="add-button" on:click={saveRelay}>Save</button>
+      </div>
+      {#if relayError}<div class="relay-error">{relayError}</div>{/if}
+    </div>
+  {:else}
+    <div class="relay-ok">
+      <span>Data relay connected</span>
+      <button on:click={editRelay}>Change</button>
+    </div>
+  {/if}
 
   <div class="add-aircraft">
     <input
@@ -16,15 +40,15 @@
       placeholder="GABC"
       bind:value={newRegistration}
       on:keydown={handleRegistrationKeydown}
-      on:keyup={stopRegistrationKeyboardEvent}
-      on:keypress={stopRegistrationKeyboardEvent}
+      on:keyup={stopKeyboardEvent}
+      on:keypress={stopKeyboardEvent}
     />
     <button class="add-button" on:click={addRegistration}>Add</button>
   </div>
 
   {#if registrations.length === 0}
     <div class="empty-state">
-      Add an aircraft registration above (example: GABI). Positions come from adsb.lol.
+      Add an aircraft registration above (example: GABI). Live positions come from adsb.lol with an adsb.fi fallback.
     </div>
   {/if}
 
@@ -41,7 +65,13 @@
             <div class="registration">{registration}</div>
             <div class="callsign">{aircraft?.flight || aircraft?.typeCode || 'Waiting for ADS-B'}</div>
           </div>
-          <span class:live={aircraft?.status === 'live'} class:stale={aircraft?.status === 'stale'} class:loading={aircraft?.status === 'loading'} class:errorDot={aircraft?.status === 'error'} class="status-dot"></span>
+          <span
+            class:live={aircraft?.status === 'live'}
+            class:stale={aircraft?.status === 'stale'}
+            class:loading={aircraft?.status === 'loading'}
+            class:errorDot={aircraft?.status === 'error'}
+            class="status-dot"
+          ></span>
         </div>
 
         {#if aircraft?.lat !== null && aircraft?.lat !== undefined}
@@ -52,11 +82,15 @@
           </div>
           <div class="subline">Position {formatAge(aircraft.seenPositionSeconds)} ago</div>
         {:else if aircraft?.status === 'loading'}
-          <div class="subline loading-line">Checking adsb.lol…</div>
+          <div class="subline loading-line">Checking aircraft…</div>
         {:else if aircraft?.error}
           <div class="error">{aircraft.error}</div>
         {:else}
           <div class="subline">Waiting for ADS-B.</div>
+        {/if}
+
+        {#if aircraft?.error && aircraft?.lat !== null && aircraft?.lat !== undefined}
+          <div class="warning">{aircraft.error}</div>
         {/if}
 
         {#if aircraft?.lastCheckedAt}
@@ -80,7 +114,7 @@
     {/each}
   </div>
 
-  <div class="footer-note">Auto refresh every 20 seconds · Aircraft are queried one at a time · Trails show the current flight from takeoff.</div>
+  <div class="footer-note">Auto refresh every 20 seconds · One live request for the whole fleet · Trails show the current flight from takeoff.<br />Data: <a href="https://www.adsb.lol/" target="_blank" rel="noreferrer">adsb.lol</a> · fallback: <a href="https://adsb.fi/" target="_blank" rel="noreferrer">adsb.fi</a></div>
 </section>
 
 <script lang="ts">
@@ -113,8 +147,10 @@
     } | null;
   };
 
-  type AdsbResponse = {
+  type RelayLiveResponse = {
     ac?: AdsbAircraft[];
+    source?: string;
+    warnings?: string[];
   };
 
   type AdsbTraceResponse = {
@@ -151,12 +187,12 @@
   };
 
   const STORAGE_KEY = 'windy-aaz-fleet-registrations-v1';
-  const TRAIL_STORAGE_KEY = 'windy-aaz-fleet-trails-v4';
+  const RELAY_STORAGE_KEY = 'windy-aaz-fleet-relay-v1';
+  const TRAIL_STORAGE_KEY = 'windy-aaz-fleet-trails-v5';
   const TRAIL_PREFS_STORAGE_KEY = 'windy-aaz-fleet-trail-prefs-v1';
   const POLL_MS = 20_000;
-  const LIVE_REQUEST_GAP_MS = 2_500;
-  const MAX_TRAIL_POINTS = 3000;
-  const MAX_TRAIL_AGE_MS = 12 * 60 * 60 * 1000;
+  const MAX_TRAIL_POINTS = 3500;
+  const MAX_TRAIL_AGE_MS = 14 * 60 * 60 * 1000;
   const MAX_LEG_GAP_MS = 45 * 60 * 1000;
 
   let registrations: string[] = [];
@@ -170,16 +206,15 @@
   let selectedRegistration: string | null = null;
   let followSelected = false;
   let trailPreferences: Record<string, boolean> = {};
-  let relayCursor = 0;
-  let zoomFixTimer: number | undefined;
+  let savedTrails: Record<string, TrailPoint[]> = {};
+  let relayBase = '';
+  let relayInput = '';
+  let relayError = '';
+  let editingRelay = false;
 
   $: hasPositions = Object.values(aircraftByReg).some(a => a.lat !== null && a.lon !== null);
 
-  const sleep = (ms: number): Promise<void> => new Promise(resolve => window.setTimeout(resolve, ms));
-
-  const stopRegistrationKeyboardEvent = (event: KeyboardEvent): void => {
-    // Windy has global keyboard shortcuts (notably F for search).
-    // Keep keystrokes typed in this input inside the plugin.
+  const stopKeyboardEvent = (event: KeyboardEvent): void => {
     event.stopPropagation();
   };
 
@@ -190,16 +225,59 @@
 
   const normalizeRegistration = (value: string): string => {
     let normalized = value.trim().toUpperCase().replace(/\s+/g, '').replace(/-/g, '');
-    // Canadian registrations can be entered as GABI instead of C-GABI.
     if (/^C[FGI][A-Z0-9]{3}$/.test(normalized)) normalized = normalized.slice(1);
     return normalized;
   };
 
   const adsbRegistration = (value: string): string => {
-    // AAZ Canadian marks are stored/displayed without the C- prefix.
     if (/^[FGI][A-Z0-9]{3}$/.test(value)) return `C-${value}`;
     return value;
   };
+
+  const normalizeRelayBase = (value: string): string => {
+    const raw = value.trim();
+    if (!raw) return '';
+    const candidate = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new Error('Invalid relay URL.');
+    let path = parsed.pathname.replace(/\/+$/, '');
+    if (path.endsWith('/api/adsb')) path = path.slice(0, -9);
+    return `${parsed.origin}${path}`;
+  };
+
+  const loadRelayBase = (): string => {
+    try {
+      return normalizeRelayBase(localStorage.getItem(RELAY_STORAGE_KEY) || '');
+    } catch {
+      return '';
+    }
+  };
+
+  const saveRelay = (): void => {
+    relayError = '';
+    try {
+      const normalized = normalizeRelayBase(relayInput);
+      if (!normalized) {
+        relayError = 'Enter the Vercel relay URL.';
+        return;
+      }
+      relayBase = normalized;
+      relayInput = normalized;
+      editingRelay = false;
+      localStorage.setItem(RELAY_STORAGE_KEY, normalized);
+      void refreshFleet();
+    } catch {
+      relayError = 'That relay URL is not valid.';
+    }
+  };
+
+  const editRelay = (): void => {
+    relayInput = relayBase;
+    editingRelay = true;
+    relayError = '';
+  };
+
+  const relayUrl = (params: URLSearchParams): string => `${relayBase}/api/adsb?${params.toString()}`;
 
   const loadSavedRegistrations = (): string[] => {
     try {
@@ -207,14 +285,14 @@
       if (!raw) return [];
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [];
-      return parsed.map(String).map(normalizeRegistration).filter(Boolean);
+      return Array.from(new Set(parsed.map(String).map(normalizeRegistration).filter(Boolean)));
     } catch {
       return [];
     }
   };
 
   const saveRegistrations = (): void => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(registrations));
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(registrations)); } catch { /* ignore */ }
   };
 
   const loadTrailPreferences = (): Record<string, boolean> => {
@@ -229,11 +307,7 @@
   };
 
   const saveTrailPreferences = (): void => {
-    try {
-      localStorage.setItem(TRAIL_PREFS_STORAGE_KEY, JSON.stringify(trailPreferences));
-    } catch {
-      // Ignore storage errors.
-    }
+    try { localStorage.setItem(TRAIL_PREFS_STORAGE_KEY, JSON.stringify(trailPreferences)); } catch { /* ignore */ }
   };
 
   const loadSavedTrails = (): Record<string, TrailPoint[]> => {
@@ -247,7 +321,7 @@
         Object.entries(parsed).map(([registration, points]) => [
           registration,
           Array.isArray(points)
-            ? points.filter((point: any) => Array.isArray(point) && point.length === 3 && typeof point[0] === 'number' && typeof point[1] === 'number' && typeof point[2] === 'number' && point[2] >= cutoff)
+            ? points.filter((point: any) => Array.isArray(point) && point.length === 3 && point.every((v: any) => typeof v === 'number') && point[2] >= cutoff)
             : [],
         ])
       );
@@ -255,8 +329,6 @@
       return {};
     }
   };
-
-  let savedTrails: Record<string, TrailPoint[]> = {};
 
   const saveTrails = (): void => {
     try {
@@ -269,7 +341,7 @@
       );
       localStorage.setItem(TRAIL_STORAGE_KEY, JSON.stringify(trails));
     } catch {
-      // Ignore storage errors; live tracking still works.
+      // Live tracking still works without local storage.
     }
   };
 
@@ -300,7 +372,7 @@
     aircraftByReg = { ...aircraftByReg, [registration]: emptyState(registration) };
     newRegistration = '';
     saveRegistrations();
-    void refreshOne(registration);
+    void refreshFleet();
   };
 
   const removeRegistration = (registration: string): void => {
@@ -324,12 +396,8 @@
     if (typeof item.lat === 'number' && typeof item.lon === 'number') {
       return { lat: item.lat, lon: item.lon, seen: item.seen_pos ?? item.seen ?? null };
     }
-    if (item.lastPosition) {
-      return {
-        lat: item.lastPosition.lat,
-        lon: item.lastPosition.lon,
-        seen: item.lastPosition.seen_pos,
-      };
+    if (item.lastPosition && typeof item.lastPosition.lat === 'number' && typeof item.lastPosition.lon === 'number') {
+      return { lat: item.lastPosition.lat, lon: item.lastPosition.lon, seen: item.lastPosition.seen_pos };
     }
     return { lat: null, lon: null, seen: item.seen ?? null };
   };
@@ -339,13 +407,10 @@
     const cutoff = now - MAX_TRAIL_AGE_MS;
     let next = previous.filter(point => point[2] >= cutoff);
 
-    // Seed a fresh trail with adsb.lol's last known position when available.
     if (next.length === 0 && item.lastPosition && lat !== null && lon !== null) {
       const previousAgeSeconds = Number(item.lastPosition.seen_pos || 0);
       const previousPoint: TrailPoint = [item.lastPosition.lat, item.lastPosition.lon, now - previousAgeSeconds * 1000];
-      if (Math.abs(previousPoint[0] - lat) > 0.00001 || Math.abs(previousPoint[1] - lon) > 0.00001) {
-        next.push(previousPoint);
-      }
+      if (Math.abs(previousPoint[0] - lat) > 0.00001 || Math.abs(previousPoint[1] - lon) > 0.00001) next.push(previousPoint);
     }
 
     if (lat === null || lon === null) return next.slice(-MAX_TRAIL_POINTS);
@@ -354,67 +419,39 @@
     return [...next, [lat, lon, now] as TrailPoint].slice(-MAX_TRAIL_POINTS);
   };
 
-  async function fetchJsonViaRelay<T>(target: string, timeoutMs = 8_000): Promise<T> {
-    // Windy plugins run in the browser and adsb.lol does not currently expose
-    // browser CORS headers. Rotate between public read-only relays and never
-    // issue more than one aircraft lookup at a time.
-    const relayBuilders = [
-      // cors.dev's documented anonymous format is a URL prefix, not ?url=.
-      // Its free public-GET tier has no monthly quota and easily covers this plugin's polling rate.
-      (url: string) => `https://proxy.cors.dev/${url}`,
-      (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-    ];
-
-    const startIndex = relayCursor % relayBuilders.length;
-    relayCursor = (relayCursor + 1) % relayBuilders.length;
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < relayBuilders.length; attempt += 1) {
-      const builder = relayBuilders[(startIndex + attempt) % relayBuilders.length];
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
-
-      try {
-        const response = await fetch(builder(target), {
-          credentials: 'omit',
-          cache: 'no-store',
-          signal: controller.signal,
-          headers: { Accept: 'application/json' },
-        });
-
-        if (response.ok) {
-          const text = await response.text();
-          try {
-            return JSON.parse(text) as T;
-          } catch {
-            lastError = new Error('ADS-B service returned an invalid response.');
-          }
-        } else {
-          const relayError = response.headers.get('X-Cors-Error');
-          lastError = new Error(relayError || `Request failed (${response.status}).`);
-        }
-      } catch (error) {
-        if (error instanceof DOMException && error.name === 'AbortError') {
-          lastError = new Error('ADS-B lookup timed out.');
-        } else {
-          lastError = error instanceof Error ? error : new Error('Unable to load ADS-B data.');
-        }
-      } finally {
-        window.clearTimeout(timeout);
+  const fetchJson<T> = async (url: string, timeoutMs = 9_000): Promise<T> => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        credentials: 'omit',
+        cache: 'no-store',
+        signal: controller.signal,
+        headers: { Accept: 'application/json' },
+      });
+      const text = await response.text();
+      let data: any = null;
+      try { data = text ? JSON.parse(text) : null; } catch { /* handled below */ }
+      if (!response.ok) {
+        const message = data?.error || data?.message || `Request failed (${response.status}).`;
+        throw new Error(message);
       }
-
-      if (attempt < relayBuilders.length - 1) await sleep(650);
+      if (data === null) throw new Error('Data relay returned an invalid response.');
+      return data as T;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw new Error('Data relay timed out.');
+      throw error;
+    } finally {
+      window.clearTimeout(timer);
     }
-
-    throw lastError || new Error('Unable to load ADS-B data.');
-  }
+  };
 
   const traceSamples = (payload: AdsbTraceResponse): TraceSample[] => {
     if (!payload.timestamp || !Array.isArray(payload.trace)) return [];
     const base = Number(payload.timestamp) * 1000;
     return payload.trace
       .map((row: any[]) => {
-        if (!Array.isArray(row) || row.length < 4) return null;
+        if (!Array.isArray(row) || row.length < 7) return null;
         const offset = Number(row[0]);
         const lat = Number(row[1]);
         const lon = Number(row[2]);
@@ -424,8 +461,6 @@
           lon,
           timestamp: base + offset * 1000,
           ground: typeof row[3] === 'string' && row[3].toLowerCase() === 'ground',
-          // readsb sets bit 2 in the trace flags when it detects the start of a new flight leg.
-          // Using this is much more reliable than guessing from time gaps/ground points.
           newLeg: (Number(row[6]) & 2) !== 0,
         } as TraceSample;
       })
@@ -439,86 +474,74 @@
     const points = samples.filter(point => point.timestamp >= cutoff);
     if (points.length <= 1) return points.map(point => [point.lat, point.lon, point.timestamp]);
 
-    // readsb/tar1090 explicitly marks the start of a new flight leg in trace flags (bit 2).
-    // Start from the MOST RECENT marker so a quick turn at an airport does not join the
-    // previous flight to the current one (the exact issue visible with GOCF).
-    let startIndex = -1;
+    // Prefer the most recent real takeoff transition. This removes the previous leg
+    // even when an aircraft made several approaches/loops during the current flight.
+    let lastTakeoff = -1;
+    for (let index = 1; index < points.length; index += 1) {
+      if (points[index - 1].ground && !points[index].ground) lastTakeoff = index;
+    }
+
+    let lastNewLeg = -1;
     for (let index = points.length - 1; index >= 0; index -= 1) {
       if (points[index].newLeg) {
-        startIndex = index;
+        lastNewLeg = index;
         break;
       }
     }
 
-    if (startIndex >= 0) {
-      return points.slice(startIndex).map(point => [point.lat, point.lon, point.timestamp]);
-    }
+    let startIndex = -1;
+    if (lastTakeoff >= 0) startIndex = Math.max(0, lastTakeoff - 1);
+    if (lastNewLeg >= 0) startIndex = Math.max(startIndex, lastNewLeg);
 
-    // Fallback for traces that do not contain a leg marker: split at the most recent
-    // meaningful ground/timing break.
-    let airborneIndex = points.length - 1;
-    while (airborneIndex >= 0 && points[airborneIndex].ground) airborneIndex -= 1;
-    if (airborneIndex < 0) return points.slice(-80).map(point => [point.lat, point.lon, point.timestamp]);
-
-    startIndex = 0;
-    for (let index = airborneIndex; index > 0; index -= 1) {
-      const gap = points[index].timestamp - points[index - 1].timestamp;
-      if (gap > MAX_LEG_GAP_MS) {
-        startIndex = index;
-        break;
-      }
-      if (points[index - 1].ground) {
-        startIndex = index - 1;
-        break;
+    if (startIndex < 0) {
+      startIndex = 0;
+      for (let index = points.length - 1; index > 0; index -= 1) {
+        if (points[index].timestamp - points[index - 1].timestamp > MAX_LEG_GAP_MS) {
+          startIndex = index;
+          break;
+        }
       }
     }
 
-    return points.slice(startIndex).map(point => [point.lat, point.lon, point.timestamp]);
-  };
-
-  const fetchFlightTrail = async (hex: string): Promise<TrailPoint[]> => {
-    const normalizedHex = hex.toLowerCase();
-    const target = `https://adsb.lol/data/traces/${normalizedHex.slice(-2)}/trace_full_${normalizedHex}.json`;
-    const payload = await fetchJsonViaRelay<AdsbTraceResponse>(target, 14_000);
-    return currentFlightLeg(traceSamples(payload));
+    const selected = points.slice(startIndex);
+    const deduped: TrailPoint[] = [];
+    for (const point of selected) {
+      const last = deduped[deduped.length - 1];
+      if (last && Math.abs(last[0] - point.lat) < 0.00001 && Math.abs(last[1] - point.lon) < 0.00001) continue;
+      deduped.push([point.lat, point.lon, point.timestamp]);
+    }
+    return deduped;
   };
 
   const trailWithLivePoint = (trail: TrailPoint[], state: AircraftState): TrailPoint[] => {
     if (state.lat === null || state.lon === null) return trail.slice(-MAX_TRAIL_POINTS);
-
     const liveTimestamp = Date.now() - Math.max(0, Number(state.seenPositionSeconds || 0)) * 1000;
     const next = [...trail];
     const last = next[next.length - 1];
-
     if (!last || Math.abs(last[0] - state.lat) > 0.00001 || Math.abs(last[1] - state.lon) > 0.00001) {
       next.push([state.lat, state.lon, liveTimestamp]);
     } else if (liveTimestamp > last[2]) {
       next[next.length - 1] = [state.lat, state.lon, liveTimestamp];
     }
-
     return next.slice(-MAX_TRAIL_POINTS);
   };
 
   const loadFlightTrail = async (registration: string): Promise<void> => {
     const state = aircraftByReg[registration];
-    if (!state?.hex || state.trailHistoryLoading || state.trailHistoryLoaded) return;
+    if (!relayBase || !state?.hex || state.trailHistoryLoading || state.trailHistoryLoaded) return;
 
-    aircraftByReg = {
-      ...aircraftByReg,
-      [registration]: { ...state, trailHistoryLoading: true },
-    };
+    aircraftByReg = { ...aircraftByReg, [registration]: { ...state, trailHistoryLoading: true } };
 
     try {
-      const historicalTrail = await fetchFlightTrail(state.hex);
+      const params = new URLSearchParams({ trace: state.hex.toLowerCase() });
+      const payload = await fetchJson<AdsbTraceResponse>(relayUrl(params), 12_000);
+      const historicalTrail = currentFlightLeg(traceSamples(payload));
       const latest = aircraftByReg[registration];
       if (!latest) return;
       const baseTrail = historicalTrail.length > 1 ? historicalTrail : latest.trail;
-      // Always join the historical current-flight trace to the latest live ADS-B position.
-      // This prevents the visible gap that could appear between the trail and the aircraft.
-      const merged = trailWithLivePoint(baseTrail, latest);
       const updated = {
         ...latest,
-        trail: merged.slice(-MAX_TRAIL_POINTS),
+        trail: trailWithLivePoint(baseTrail, latest),
         trailHistoryLoaded: true,
         trailHistoryLoading: false,
       };
@@ -528,130 +551,129 @@
     } catch {
       const latest = aircraftByReg[registration];
       if (!latest) return;
-      const updated = {
-        ...latest,
-        trailHistoryLoaded: false,
-        trailHistoryLoading: false,
-      };
+      const updated = { ...latest, trailHistoryLoaded: false, trailHistoryLoading: false };
       aircraftByReg = { ...aircraftByReg, [registration]: updated };
       renderAircraft(updated);
     }
   };
 
-  const fetchAdsb = async (registration: string): Promise<AircraftState> => {
-    const previous = aircraftByReg[registration] || emptyState(registration);
-    const apiRegistration = adsbRegistration(registration);
-    const target = `https://api.adsb.lol/v2/reg/${encodeURIComponent(apiRegistration)}`;
+  const stateFromItem = (registration: string, previous: AircraftState, item: AdsbAircraft, checkedAt: number): AircraftState => {
+    const position = choosePosition(item);
+    const age = position.seen;
+    const live = position.lat !== null && position.lon !== null && (age === null || age <= 90);
+    const heading = item.track ?? item.true_heading ?? item.mag_heading ?? previous.track;
 
-    try {
-      const payload = await fetchJsonViaRelay<AdsbResponse>(target);
-      const item = payload.ac?.[0];
-      const checkedAt = Date.now();
-
-      if (!item) {
-        const hasLastPosition = previous.lat !== null && previous.lon !== null;
-        return {
-          ...previous,
-          status: hasLastPosition ? 'stale' : 'missing',
-          error: hasLastPosition ? 'No new ADS-B position. Showing the last known position.' : 'No live ADS-B signal right now.',
-          lastCheckedAt: checkedAt,
-        };
-      }
-
-      const position = choosePosition(item);
-      const age = position.seen;
-      const status: AircraftState['status'] = age !== null && age <= 90 ? 'live' : 'stale';
-      const heading = item.track ?? item.true_heading ?? item.mag_heading ?? previous.track;
-
-      return {
-        registration,
-        hex: item.hex || null,
-        flight: item.flight?.trim() || null,
-        typeCode: item.t || null,
-        lat: position.lat,
-        lon: position.lon,
-        altitude: item.alt_baro ?? item.alt_geom ?? null,
-        groundSpeed: item.gs ?? null,
-        track: heading ?? null,
-        seenPositionSeconds: age,
-        status: position.lat === null ? 'missing' : status,
-        error: position.lat === null ? 'Aircraft found, but no position is available.' : null,
-        lastCheckedAt: checkedAt,
-        trail: updateTrail(previous.trail, item, position.lat, position.lon),
-        trailVisible: previous.trailVisible,
-        trailHistoryLoaded: previous.trailHistoryLoaded,
-        trailHistoryLoading: previous.trailHistoryLoading,
-      };
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        throw new Error('ADS-B lookup timed out. Tap Refresh to try again.');
-      }
-      throw error;
-    }
+    return {
+      registration,
+      hex: item.hex || previous.hex,
+      flight: item.flight?.trim() || previous.flight,
+      typeCode: item.t || previous.typeCode,
+      lat: position.lat ?? previous.lat,
+      lon: position.lon ?? previous.lon,
+      altitude: item.alt_baro ?? item.alt_geom ?? previous.altitude,
+      groundSpeed: item.gs ?? previous.groundSpeed,
+      track: heading ?? null,
+      seenPositionSeconds: age,
+      status: position.lat === null ? (previous.lat !== null ? 'stale' : 'missing') : live ? 'live' : 'stale',
+      error: position.lat === null && previous.lat === null ? 'Aircraft found, but no position is available.' : null,
+      lastCheckedAt: checkedAt,
+      trail: updateTrail(previous.trail, item, position.lat ?? previous.lat, position.lon ?? previous.lon),
+      trailVisible: previous.trailVisible,
+      trailHistoryLoaded: previous.trailHistoryLoaded,
+      trailHistoryLoading: previous.trailHistoryLoading,
+    };
   };
 
-  const refreshOne = async (registration: string): Promise<void> => {
-    const previous = aircraftByReg[registration] || emptyState(registration);
-    aircraftByReg = {
-      ...aircraftByReg,
-      [registration]: { ...previous, status: 'loading', error: null },
-    };
-
-    try {
-      const state = await fetchAdsb(registration);
-      aircraftByReg = { ...aircraftByReg, [registration]: state };
-      saveTrails();
-      renderAircraft(state);
-      if (state.trailVisible && state.hex && !state.trailHistoryLoaded && !state.trailHistoryLoading) {
-        void loadFlightTrail(registration);
-      }
-    } catch (error) {
-      const latest = aircraftByReg[registration] || previous;
-      let message = error instanceof Error ? error.message : 'Unable to load ADS-B data.';
-      if (/429|rate-limit/i.test(message)) {
-        message = 'Live update delayed. Keeping the last known position.';
-      }
-      const hasLastPosition = latest.lat !== null && latest.lon !== null;
-      const failedState: AircraftState = {
-        ...latest,
-        status: hasLastPosition ? 'stale' : 'error',
-        error: hasLastPosition ? `Live update delayed. ${message}` : message,
-        lastCheckedAt: Date.now(),
-      };
-      aircraftByReg = { ...aircraftByReg, [registration]: failedState };
-      // Keep the existing marker/trail visible even if one refresh fails.
-      renderAircraft(failedState);
+  const markFleetLoading = (): void => {
+    const next = { ...aircraftByReg };
+    for (const registration of registrations) {
+      const previous = next[registration] || emptyState(registration);
+      next[registration] = { ...previous, status: 'loading', error: null };
     }
+    aircraftByReg = next;
   };
 
   const refreshFleet = async (): Promise<void> => {
-    if (refreshing || registrations.length === 0) return;
+    if (refreshing || registrations.length === 0 || !relayBase) return;
     refreshing = true;
+    markFleetLoading();
 
     try {
-      // Query one registration at a time. The bulk registration URL proved unreliable
-      // through browser CORS relays and could make every aircraft time out together.
-      for (let index = 0; index < registrations.length; index += 1) {
-        await refreshOne(registrations[index]);
-        if (index < registrations.length - 1) await sleep(LIVE_REQUEST_GAP_MS);
+      const requested = registrations.map(adsbRegistration);
+      const params = new URLSearchParams({ regs: requested.join(',') });
+      const payload = await fetchJson<RelayLiveResponse>(relayUrl(params), 11_000);
+      const checkedAt = Date.now();
+      const items = Array.isArray(payload.ac) ? payload.ac : [];
+      const itemByRegistration = new Map<string, AdsbAircraft>();
+
+      for (const item of items) {
+        if (!item?.r) continue;
+        itemByRegistration.set(normalizeRegistration(item.r), item);
       }
+
+      const next = { ...aircraftByReg };
+      for (const registration of registrations) {
+        const previous = next[registration] || emptyState(registration);
+        const item = itemByRegistration.get(registration);
+        if (item) {
+          next[registration] = stateFromItem(registration, previous, item, checkedAt);
+        } else {
+          const hasLastPosition = previous.lat !== null && previous.lon !== null;
+          next[registration] = {
+            ...previous,
+            status: hasLastPosition ? 'stale' : 'missing',
+            error: hasLastPosition ? 'No new ADS-B position. Keeping the last known position.' : 'No live ADS-B signal right now.',
+            lastCheckedAt: checkedAt,
+          };
+        }
+      }
+
+      aircraftByReg = next;
+      saveTrails();
+      renderAll();
+
+      for (const registration of registrations) {
+        const state = aircraftByReg[registration];
+        if (state?.trailVisible && state.hex && !state.trailHistoryLoaded && !state.trailHistoryLoading) void loadFlightTrail(registration);
+      }
+    } catch (error) {
+      const checkedAt = Date.now();
+      const message = error instanceof Error ? error.message : 'Unable to load ADS-B data.';
+      const next = { ...aircraftByReg };
+      for (const registration of registrations) {
+        const previous = next[registration] || emptyState(registration);
+        const hasLastPosition = previous.lat !== null && previous.lon !== null;
+        next[registration] = {
+          ...previous,
+          status: hasLastPosition ? 'stale' : 'error',
+          error: hasLastPosition ? `Live update delayed. ${message}` : message,
+          lastCheckedAt: checkedAt,
+        };
+      }
+      aircraftByReg = next;
+      renderAll();
     } finally {
       refreshing = false;
     }
   };
 
-  const makeAircraftIcon = (state: AircraftState): any => {
-    const heading = state.track ?? 0;
-    const staleClass = state.status === 'live' ? '' : ' is-stale';
+  const makeAircraftIcon = (): any => {
     const planeSvg = `<svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 1.5c-1.25 0-2.15 1.02-2.15 2.35v7.66L5.2 15.9v3.15l8.65-2.38v6.84l-3.05 2.18v2.24L16 26.7l5.2 1.23v-2.24l-3.05-2.18v-6.84l8.65 2.38V15.9l-8.65-4.39V3.85c0-1.33-.9-2.35-2.15-2.35Z"/></svg>`;
     return L.divIcon({
       className: 'aaz-aircraft-marker',
-      html: `<div class="aaz-marker-wrap${staleClass}"><div class="aaz-plane-badge"><div class="aaz-plane" style="transform:rotate(${heading}deg)">${planeSvg}</div></div><div class="aaz-label">${state.registration}</div></div>`,
-      iconSize: [86, 58],
-      iconAnchor: [43, 21],
+      html: `<div class="aaz-plane-badge"><div class="aaz-plane-rotator">${planeSvg}</div></div>`,
+      iconSize: [42, 42],
+      iconAnchor: [21, 21],
     });
   };
 
+  const updateMarkerVisual = (marker: any, state: AircraftState): void => {
+    const root = marker?._icon as HTMLElement | undefined;
+    if (!root) return;
+    root.classList.toggle('aaz-marker-stale', state.status !== 'live');
+    const rotator = root.querySelector('.aaz-plane-rotator') as HTMLElement | null;
+    if (rotator) rotator.style.transform = `rotate(${state.track ?? 0}deg)`;
+  };
 
   const renderAircraft = (state: AircraftState): void => {
     if (state.lat === null || state.lon === null) return;
@@ -659,28 +681,37 @@
     let marker = markers.get(state.registration);
 
     if (!marker) {
-      marker = new L.Marker(point, { icon: makeAircraftIcon(state), zIndexOffset: 1000 }).addTo(map);
+      marker = new L.Marker(point, { icon: makeAircraftIcon(), zIndexOffset: 1000 }).addTo(map);
+      marker.bindTooltip(state.registration, {
+        permanent: true,
+        direction: 'bottom',
+        offset: [0, 15],
+        className: 'aaz-label-tooltip',
+        opacity: 1,
+        interactive: false,
+      });
       marker.on('click', () => selectAircraft(state.registration, true));
       markers.set(state.registration, marker);
     } else {
-      // Let Windy/Leaflet own marker positioning. Custom animation was fighting
-      // the map's zoom transform and could throw the icon across the screen.
+      // Important: never call setIcon here. Windy/LeafletGL owns the marker's
+      // positioning transform. Recreating the icon while zooming caused the marker
+      // to jump across the screen in earlier builds.
       marker.setLatLng(point);
-      marker.setIcon(makeAircraftIcon(state));
     }
 
-    // Keep the visible line physically attached to the live aircraft marker even
-    // when the historical trace endpoint is a few samples behind.
+    updateMarkerVisual(marker, state);
+
     const displayTrail = trailWithLivePoint(state.trail, state);
-    const trailLatLngs = displayTrail.map(point => [point[0], point[1]] as LatLonTuple);
+    const trailLatLngs = displayTrail.map(p => [p[0], p[1]] as LatLonTuple);
     let casing = trailCasings.get(state.registration);
     let line = trailLines.get(state.registration);
+
     if (state.trailVisible && trailLatLngs.length > 1) {
       if (!casing) {
         casing = new L.Polyline(trailLatLngs, {
-          color: '#101214',
-          weight: 3,
-          opacity: 0.78,
+          color: '#111315',
+          weight: 2.6,
+          opacity: 0.82,
           lineCap: 'round',
           lineJoin: 'round',
           interactive: false,
@@ -693,7 +724,7 @@
       if (!line) {
         line = new L.Polyline(trailLatLngs, {
           color: '#ff6a00',
-          weight: 1.5,
+          weight: 1.35,
           opacity: 1,
           lineCap: 'round',
           lineJoin: 'round',
@@ -714,9 +745,7 @@
       }
     }
 
-    if (selectedRegistration === state.registration && followSelected) {
-      map.panTo(point);
-    }
+    if (selectedRegistration === state.registration && followSelected) map.panTo(point);
   };
 
   const renderAll = (): void => {
@@ -770,9 +799,7 @@
     aircraftByReg = { ...aircraftByReg, [registration]: updated };
     renderAircraft(updated);
 
-    if (trailVisible && updated.hex && !updated.trailHistoryLoaded) {
-      await loadFlightTrail(registration);
-    }
+    if (trailVisible && updated.hex && !updated.trailHistoryLoaded) await loadFlightTrail(registration);
   };
 
   const fitAll = (): void => {
@@ -785,21 +812,6 @@
       return;
     }
     map.fitBounds(L.latLngBounds(points), { padding: [40, 40], maxZoom: 8 });
-  };
-
-  const reapplyMarkersAfterZoom = (): void => {
-    if (zoomFixTimer !== undefined) window.clearTimeout(zoomFixTimer);
-    // Windy's Leaflet GL marker positioning finishes after the zoom event. Reapply
-    // our inner aircraft rotation/anchor just after that internal update.
-    zoomFixTimer = window.setTimeout(() => {
-      for (const state of Object.values(aircraftByReg)) {
-        if (state.lat === null || state.lon === null) continue;
-        const marker = markers.get(state.registration);
-        if (!marker) continue;
-        marker.setLatLng([state.lat, state.lon]);
-        marker.setIcon(makeAircraftIcon(state));
-      }
-    }, 120);
   };
 
   const formatAltitude = (altitude: number | string | null): string => {
@@ -825,17 +837,17 @@
   onMount(() => {
     savedTrails = loadSavedTrails();
     trailPreferences = loadTrailPreferences();
+    relayBase = loadRelayBase();
+    relayInput = relayBase;
     registrations = loadSavedRegistrations();
     aircraftByReg = Object.fromEntries(registrations.map(reg => [reg, emptyState(reg)]));
-    void refreshFleet();
+    renderAll();
+    if (relayBase) void refreshFleet();
     refreshTimer = window.setInterval(() => void refreshFleet(), POLL_MS);
-    map.on('zoomend', reapplyMarkersAfterZoom);
   });
 
   onDestroy(() => {
     if (refreshTimer !== undefined) window.clearInterval(refreshTimer);
-    if (zoomFixTimer !== undefined) window.clearTimeout(zoomFixTimer);
-    map.off('zoomend', reapplyMarkersAfterZoom);
     markers.forEach(marker => map.removeLayer(marker));
     trailCasings.forEach(line => map.removeLayer(line));
     trailLines.forEach(line => map.removeLayer(line));
@@ -862,7 +874,8 @@
 
   .action,
   .add-button,
-  .card-actions button {
+  .card-actions button,
+  .relay-ok button {
     border: 0;
     border-radius: 7px;
     padding: 7px 10px;
@@ -870,7 +883,8 @@
   }
 
   .action,
-  .card-actions button {
+  .card-actions button,
+  .relay-ok button {
     background: #eceff1;
     color: #1b1d1f;
   }
@@ -878,6 +892,67 @@
   .action:disabled {
     opacity: 0.45;
     cursor: default;
+  }
+
+  .relay-card {
+    margin-bottom: 10px;
+    padding: 10px;
+    border-radius: 9px;
+    background: #2e3033;
+    border: 1px solid #5c6267;
+  }
+
+  .relay-title {
+    font-size: 13px;
+    font-weight: 800;
+    color: #fff;
+  }
+
+  .relay-copy {
+    margin-top: 3px;
+    color: #c6cacf;
+    font-size: 11px;
+    line-height: 1.35;
+  }
+
+  .relay-row {
+    display: flex;
+    gap: 7px;
+    margin-top: 8px;
+  }
+
+  .relay-row input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid #686d72;
+    border-radius: 7px;
+    padding: 8px 10px;
+    background: #fff;
+    color: #16191b !important;
+  }
+
+  .relay-error {
+    margin-top: 5px;
+    color: #ff9f96;
+    font-size: 11px;
+  }
+
+  .relay-ok {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 10px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    background: #2e3033;
+    color: #bfe8c7;
+    font-size: 11px;
+  }
+
+  .relay-ok button {
+    padding: 4px 7px;
+    font-size: 10px;
   }
 
   .add-aircraft {
@@ -899,7 +974,8 @@
     font-weight: 600;
   }
 
-  .add-aircraft input::placeholder { color: #70767b; opacity: 1; }
+  .add-aircraft input::placeholder,
+  .relay-row input::placeholder { color: #70767b; opacity: 1; }
 
   .add-button {
     background: #f36f21;
@@ -1003,12 +1079,15 @@
     white-space: nowrap;
   }
 
-  .error {
+  .error,
+  .warning {
     margin-top: 8px;
     font-size: 12px;
     line-height: 1.35;
     color: #ff9f96 !important;
   }
+
+  .warning { color: #f0bf72 !important; }
 
   .card-actions {
     display: flex;
@@ -1047,62 +1126,52 @@
     border: 0 !important;
   }
 
-  :global(.aaz-marker-wrap) {
-    position: relative;
-    width: 86px;
-    height: 58px;
-    pointer-events: auto;
-  }
-
   :global(.aaz-plane-badge) {
-    position: absolute;
-    left: 24px;
-    top: 0;
-    width: 38px;
-    height: 38px;
+    width: 36px;
+    height: 36px;
+    margin: 3px;
     border-radius: 50%;
     background: rgba(18, 19, 21, 0.94);
-    border: 3px solid #ff6a00;
-    box-shadow: 0 2px 7px rgba(0,0,0,0.62);
+    border: 2px solid #ff6a00;
+    box-shadow: 0 2px 7px rgba(0, 0, 0, 0.62);
     display: flex;
     align-items: center;
     justify-content: center;
   }
 
-  :global(.aaz-plane) {
-    width: 29px;
-    height: 29px;
+  :global(.aaz-plane-rotator) {
+    width: 27px;
+    height: 27px;
     transform-origin: 50% 50%;
+    transition: transform 180ms linear;
   }
 
-  :global(.aaz-plane svg) {
+  :global(.aaz-plane-rotator svg) {
     display: block;
-    width: 29px;
-    height: 29px;
+    width: 27px;
+    height: 27px;
     overflow: visible;
     fill: #ffffff;
     stroke: #111315;
     stroke-width: 1.6px;
     stroke-linejoin: round;
     paint-order: stroke fill;
-    filter: drop-shadow(0 1px 1px rgba(0,0,0,0.75));
+    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.75));
   }
 
-  :global(.aaz-marker-wrap.is-stale .aaz-plane-badge) { opacity: 0.68; }
+  :global(.aaz-marker-stale .aaz-plane-badge) { opacity: 0.65; }
 
-  :global(.aaz-label) {
-    position: absolute;
-    left: 50%;
-    top: 41px;
-    transform: translateX(-50%);
-    background: rgba(18, 19, 21, 0.94);
-    color: #ffffff;
-    border: 1px solid #ff6a00;
-    border-radius: 4px;
-    padding: 2px 6px;
-    font-size: 10px;
-    font-weight: 800;
-    white-space: nowrap;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.45);
+  :global(.aaz-label-tooltip) {
+    background: rgba(18, 19, 21, 0.95) !important;
+    color: #ffffff !important;
+    border: 1px solid #ff6a00 !important;
+    border-radius: 4px !important;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45) !important;
+    padding: 2px 6px !important;
+    font-size: 10px !important;
+    font-weight: 800 !important;
+    white-space: nowrap !important;
   }
+
+  :global(.aaz-label-tooltip::before) { display: none !important; }
 </style>

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "builds": [
+    { "src": "api-adsb.js", "use": "@vercel/node" }
+  ],
+  "routes": [
+    { "src": "/api/adsb", "dest": "/api-adsb.js" }
+  ]
+}
